@@ -6,10 +6,11 @@ import time
 from datetime import datetime, timedelta
 import os
 import base64
+import uuid
 
 app = Flask(__name__)
 
-# key for cookie safety. Shal be overridden using ENV var SECRET_KEY
+# key for cookie safety. Shall be overridden using ENV var SECRET_KEY
 app.secret_key = os.getenv("SECRET_KEY", "lasfuoi3ro8w7gfow3bwiubdwoeg7p23r8g23rg")
 
 # Description of info keys
@@ -128,40 +129,50 @@ def login():
         host = request.form["host"]
         port = int(request.form["port"])
         db = int(request.form["db"])
-        url = url_for("server_db", host=host, port=port, db=db)
-        return redirect(url)
+        auth = request.form.get("auth")
+        session["conn_info"] = { "host": host, "port": port, "db": db, "auth": auth }
+
+        return redirect(url_for("server_db"))
     else: 
         s = time.time()
+
+        default_conn_info = { "host": "localhost", "port":6379, "db": 0}
+        conn_info = session.get("conn_info", default_conn_info)
         return render_template('login.html',
-            duration=time.time()-s)
+            duration=time.time()-s, **conn_info)
 
 
-@app.route("/<host>:<int:port>/<int:db>/")
-def server_db(host, port, db):
+@app.route("/server/")
+def server_db():
     """
     List all databases and show info on server
     """
     s = time.time()
-    r = redis.StrictRedis(host=host, port=port, db=0)
+    conn_info = session["conn_info"]
+    r = get_redis_connection(conn_info)
+    
     info = r.info("all")
     dbsize = r.dbsize()
     return render_template('server.html',
-        host=host,
-        port=port,
-        db=db,
+        host=conn_info["host"],
+        port=conn_info["port"],
+        db=conn_info["db"],
         info=info,
         dbsize=dbsize,
         serverinfo_meta=serverinfo_meta,
         duration=time.time()-s)
 
 
-@app.route("/<host>:<int:port>/<int:db>/keys/", methods=['GET', 'POST'])
-def keys(host, port, db):
+@app.route("/keys/", methods=['GET', 'POST'])
+def keys():
     """
     List keys for one database
     """
+    print("in keys")
     s = time.time()
-    r = redis.StrictRedis(host=host, port=port, db=db)
+    conn_info = session["conn_info"]
+    r = get_redis_connection(conn_info)
+    r.set("test", "one".encode('utf-8'))
     if request.method == "POST":
         action = request.form["action"]
         app.logger.debug(action)
@@ -174,19 +185,24 @@ def keys(host, port, db):
                     flash("Key %s could not be deleted." % request.form["key"], category="error")
         return redirect(request.url)
     else:
+        print("method was GET")
         offset = int(request.args.get("offset", "0"))
         perpage = int(request.args.get("perpage", "10"))
         pattern = request.args.get('pattern', '*')
         dbsize = r.dbsize()
         keys = sorted(r.keys(pattern))
-        limited_keys = keys[offset:(perpage+offset)]
+        print("keys: %s" % keys)
+        limited_keys = keys[offset:(perpage + offset)]
+        print("limited: %s" % limited_keys)
         types = {}
         for key in limited_keys:
+            print("building type for key %s" % key)
             types[key] = r.type(key)
+        print("rendering for %s" % conn_info)
         return render_template('keys.html',
-            host=host,
-            port=port,
-            db=db,
+            host=conn_info["host"],
+            port=conn_info["port"],
+            db=conn_info["db"],
             dbsize=dbsize,
             keys=limited_keys,
             types=types,
@@ -197,7 +213,7 @@ def keys(host, port, db):
             duration=time.time()-s)
 
 
-@app.route("/<host>:<int:port>/<int:db>/keys/<key>/")
+@app.route("/keys/<key>/")
 def key(host, port, db, key):
     """
     Show a specific key.
@@ -205,7 +221,8 @@ def key(host, port, db, key):
     """
     key = base64.urlsafe_b64decode(key.encode("utf8"))
     s = time.time()
-    r = redis.StrictRedis(host=host, port=port, db=db)
+    conn_info = session["conn_info"]
+    r = get_redis_connection(conn_info)
     dump = r.dump(key)
     if dump is None:
         abort(404)
@@ -226,9 +243,9 @@ def key(host, port, db, key):
     elif t == "zset":
         val = r.zrange(key, 0, -1, withscores=True)
     return render_template('key.html',
-        host=host,
-        port=port,
-        db=db,
+        host=conn_info["host"],
+        port=conn_info["port"],
+        db=conn_info["db"],
         key=key,
         value=val,
         type=t,
@@ -239,21 +256,23 @@ def key(host, port, db, key):
         duration=time.time()-s)
 
 
-@app.route("/<host>:<int:port>/<int:db>/pubsub/")
-def pubsub(host, port, db):
+@app.route("/pubsub/")
+def pubsub():
     """
     List PubSub channels
     """
     s = time.time()
+    conn_info = session["conn_info"]
     return render_template('pubsub.html',
-        host=host,
-        port=port,
-        db=db,
+        host=conn_info["host"],
+        port=conn_info["port"],
+        db=conn_info["db"],
         duration=time.time()-s)
 
 
-def pubsub_event_stream(host, port, db, pattern):
-    r = redis.StrictRedis(host=host, port=port, db=db)
+def pubsub_event_stream(pattern):
+    conn_info = session["conn_info"]
+    r = get_redis_connection(conn_info)
     p = r.pubsub()
     p.psubscribe(pattern)
     for message in p.listen():
@@ -261,9 +280,11 @@ def pubsub_event_stream(host, port, db, pattern):
             yield 'data: %s\n\n' % json.dumps(message)
 
 
-@app.route("/<host>:<int:port>/<int:db>/pubsub/api/")
-def pubsub_ajax(host, port, db):
-    return Response(pubsub_event_stream(host, port, db, pattern="*"),
+@app.route("/pubsub/api/")
+def pubsub_ajax():
+    conn_info = session["conn_info"]
+    r = get_redis_connection(conn_info)
+    return Response(pubsub_event_stream(conn_info["host"], conn_info["port"], conn_info["db"], pattern="*"),
            mimetype="text/event-stream")
 
 
@@ -271,10 +292,11 @@ def pubsub_ajax(host, port, db):
 def urlsafe_base64_encode(s):
     if type(s) == 'Markup':
         s = s.unescape()
-    s = s.encode('utf8')
     s = base64.urlsafe_b64encode(s)
     return Markup(s)
 
+def get_redis_connection(conn_info):
+    return redis.StrictRedis(host=conn_info["host"], port=conn_info["port"], db=conn_info["db"], password=conn_info["auth"])
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", debug=False, port=5001, threaded=True)
